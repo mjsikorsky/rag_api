@@ -54,10 +54,9 @@ from app.config import (
 # (so non-numeric stale values don't break startup), which means the parsed
 # value is always None for Atlas — and relying on it would suppress the
 # warning we want operators to see.
-if (
-    VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO
-    and os.getenv("RAG_DISTANCE_THRESHOLD") not in (None, "")
-):
+if VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO and os.getenv(
+    "RAG_DISTANCE_THRESHOLD"
+) not in (None, ""):
     logger.warning(
         "RAG_DISTANCE_THRESHOLD is set but VECTOR_DB_TYPE=atlas-mongo; "
         "Atlas returns similarity scores (higher = better) which would "
@@ -78,7 +77,10 @@ def _apply_distance_threshold(documents):
     if VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
         return documents
     return [(doc, score) for doc, score in documents if score <= RAG_DISTANCE_THRESHOLD]
+
+
 from app.constants import ERROR_MESSAGES
+from app.capabilities import require_rag_capability
 from app.models import (
     StoreDocument,
     QueryRequestBody,
@@ -319,6 +321,7 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
 
 @router.delete("/documents")
 async def delete_documents(request: Request, document_ids: List[str] = Body(...)):
+    require_rag_capability(request, "delete", document_ids)
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
@@ -373,6 +376,7 @@ async def query_embeddings_by_file_id(
             body.entity_id if body.entity_id else request.state.user.get("id")
         )
 
+    require_rag_capability(request, "query", [body.file_id])
     authorized_documents = []
 
     try:
@@ -695,6 +699,7 @@ def _prepare_documents_sync(
     file_id: str,
     user_id: str,
     clean_content: bool,
+    index_metadata: Optional[dict] = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
@@ -719,6 +724,7 @@ def _prepare_documents_sync(
                 "user_id": user_id,
                 "digest": generate_digest(doc.page_content),
                 **(doc.metadata or {}),
+                **(index_metadata or {}),
             },
         )
         for doc in documents
@@ -731,6 +737,7 @@ async def store_data_in_vector_db(
     user_id: str = "",
     clean_content: bool = False,
     executor=None,
+    index_metadata: Optional[dict] = None,
 ) -> bool:
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -741,6 +748,7 @@ async def store_data_in_vector_db(
         file_id,
         user_id,
         clean_content,
+        index_metadata,
     )
 
     try:
@@ -861,6 +869,7 @@ async def embed_file(
     file: UploadFile = File(...),
     entity_id: str = Form(None),
 ):
+    require_rag_capability(request, "embed", [file_id])
     response_status = True
     response_message = "File processed successfully."
     known_type = None
@@ -943,8 +952,87 @@ async def embed_file(
     }
 
 
+@router.post("/reindex")
+async def reindex_file(
+    request: Request,
+    file_id: str = Form(...),
+    file: UploadFile = File(...),
+    entity_id: str = Form(None),
+    generation: str = Form(...),
+    source_digest: str = Form(None),
+):
+    """Atomically replace stale vectors from current source bytes."""
+    require_rag_capability(request, "embed", [file_id])
+    user_id = get_user_id(request, entity_id)
+    temp_path = _make_unique_temp_path(user_id, file.filename)
+    if temp_path is None:
+        raise HTTPException(status_code=400, detail="Invalid request")
+    try:
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+        await save_upload_file_async(file, temp_path)
+        digest = hashlib.sha256()
+        async with aiofiles.open(temp_path, "rb") as source:
+            while chunk := await source.read(64 * 1024):
+                digest.update(chunk)
+        actual_digest = digest.hexdigest()
+        if source_digest and source_digest != actual_digest:
+            raise HTTPException(status_code=409, detail="Source digest mismatch")
+        data, _, file_ext = await load_file_content(
+            file.filename, file.content_type, temp_path, request.app.state.thread_pool
+        )
+        if isinstance(vector_store, AsyncPgVector):
+            previous = await vector_store.get_documents_by_ids(
+                [file_id], executor=request.app.state.thread_pool
+            )
+            await vector_store.delete(
+                ids=[file_id], executor=request.app.state.thread_pool
+            )
+        else:
+            previous = vector_store.get_documents_by_ids([file_id])
+            vector_store.delete(ids=[file_id])
+        try:
+            result = await store_data_in_vector_db(
+                data,
+                file_id,
+                user_id,
+                clean_content=file_ext == "pdf",
+                executor=request.app.state.thread_pool,
+                index_metadata={
+                    "index_generation": generation,
+                    "source_digest": actual_digest,
+                },
+            )
+            if not result or "error" in result:
+                raise RuntimeError("Failed to rebuild index")
+        except Exception:
+            if isinstance(vector_store, AsyncPgVector):
+                await vector_store.delete(
+                    ids=[file_id], executor=request.app.state.thread_pool
+                )
+                if previous:
+                    await vector_store.aadd_documents(
+                        previous,
+                        ids=[file_id] * len(previous),
+                        executor=request.app.state.thread_pool,
+                    )
+            else:
+                vector_store.delete(ids=[file_id])
+                if previous:
+                    vector_store.add_documents(previous, ids=[file_id] * len(previous))
+            raise HTTPException(status_code=500, detail="Failed to rebuild index")
+        return {
+            "status": True,
+            "file_id": file_id,
+            "generation": generation,
+            "digest": actual_digest,
+        }
+    finally:
+        await cleanup_temp_file_async(temp_path)
+
+
 @router.get("/documents/{id}/context")
 async def load_document_context(request: Request, id: str):
+    require_rag_capability(request, "context", [id])
     ids = [id]
     try:
         if isinstance(vector_store, AsyncPgVector):
@@ -998,6 +1086,7 @@ async def embed_file_upload(
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
 ):
+    require_rag_capability(request, "embed", [file_id])
     user_id = get_user_id(request, entity_id)
 
     validated_temp_file_path = _make_unique_temp_path(user_id, uploaded_file.filename)
@@ -1066,6 +1155,7 @@ async def embed_file_upload(
 
 @router.post("/query_multiple")
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
+    require_rag_capability(request, "query", body.file_ids)
     try:
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
@@ -1117,6 +1207,7 @@ async def extract_text_from_file(
     file: UploadFile = File(...),
     entity_id: str = Form(None),
 ):
+    require_rag_capability(request, "text", [file_id])
     """
     Extract text content from an uploaded file without creating embeddings.
     Returns the raw text content for text parsing purposes.
