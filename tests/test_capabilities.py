@@ -1,6 +1,6 @@
 import pytest
 from fastapi import HTTPException
-from app.capabilities import require_rag_capability
+from app.capabilities import require_rag_capability, require_rag_tenant
 
 
 class Request:
@@ -38,3 +38,27 @@ def test_unscoped_authenticated_token_refuses():
 
 def test_auth_disabled_preserves_public_mode():
     assert require_rag_capability(Request(), "query", ["a"]) == {}
+
+
+def test_matching_persisted_tenant_passes():
+    metadata = [{"tenant_id": "tenant-a"}]
+    require_rag_tenant({"tenant": "tenant-a"}, metadata)
+
+
+def test_cross_tenant_document_refuses():
+    metadata = [{"tenant_id": "tenant-a"}]
+    with pytest.raises(HTTPException) as error:
+        require_rag_tenant({"tenant": "tenant-b"}, metadata)
+    assert error.value.status_code == 403
+
+
+def test_scoped_tenant_refuses_legacy_unbound_document():
+    metadata = [{}]
+    with pytest.raises(HTTPException) as error:
+        require_rag_tenant({"tenant": "tenant-a"}, metadata)
+    assert error.value.status_code == 403
+
+
+def test_unscoped_compatibility_accepts_legacy_document():
+    metadata = [{}]
+    require_rag_tenant({}, metadata)

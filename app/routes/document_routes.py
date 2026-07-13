@@ -80,7 +80,7 @@ def _apply_distance_threshold(documents):
 
 
 from app.constants import ERROR_MESSAGES
-from app.capabilities import require_rag_capability
+from app.capabilities import require_rag_capability, require_rag_tenant
 from app.models import (
     StoreDocument,
     QueryRequestBody,
@@ -279,6 +279,7 @@ async def health_check():
 
 @router.get("/documents", response_model=list[DocumentResponse])
 async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
+    claims = require_rag_capability(request, "context", ids)
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
@@ -290,6 +291,8 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         else:
             existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
+
+        require_rag_tenant(claims, (document.metadata for document in documents))
 
         # Ensure all requested ids exist
         if not all(id in existing_ids for id in ids):
@@ -321,17 +324,23 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
 
 @router.delete("/documents")
 async def delete_documents(request: Request, document_ids: List[str] = Body(...)):
-    require_rag_capability(request, "delete", document_ids)
+    claims = require_rag_capability(request, "delete", document_ids)
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
                 document_ids, executor=request.app.state.thread_pool
             )
+            documents = await vector_store.get_documents_by_ids(
+                document_ids, executor=request.app.state.thread_pool
+            )
+            require_rag_tenant(claims, (document.metadata for document in documents))
             await vector_store.delete(
                 ids=document_ids, executor=request.app.state.thread_pool
             )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
+            documents = vector_store.get_documents_by_ids(document_ids)
+            require_rag_tenant(claims, (document.metadata for document in documents))
             vector_store.delete(ids=document_ids)
 
         if not all(id in existing_ids for id in document_ids):
@@ -376,7 +385,7 @@ async def query_embeddings_by_file_id(
             body.entity_id if body.entity_id else request.state.user.get("id")
         )
 
-    require_rag_capability(request, "query", [body.file_id])
+    claims = require_rag_capability(request, "query", [body.file_id])
     authorized_documents = []
 
     try:
@@ -395,6 +404,7 @@ async def query_embeddings_by_file_id(
             )
 
         documents = _apply_distance_threshold(documents)
+        require_rag_tenant(claims, (document.metadata for document, _ in documents))
 
         if not documents:
             return authorized_documents
@@ -792,6 +802,7 @@ async def store_data_in_vector_db(
 async def embed_local_file(
     document: StoreDocument, request: Request, entity_id: str = None
 ):
+    claims = require_rag_capability(request, "embed", [document.file_id])
     file_path = validate_file_path(RAG_UPLOAD_DIR, document.filepath)
 
     # Check if the file exists and if it is within the allowed upload directory
@@ -823,6 +834,9 @@ async def embed_local_file(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            index_metadata=(
+                {"tenant_id": claims["tenant"]} if claims.get("tenant") else None
+            ),
         )
 
         if result:
@@ -869,7 +883,7 @@ async def embed_file(
     file: UploadFile = File(...),
     entity_id: str = Form(None),
 ):
-    require_rag_capability(request, "embed", [file_id])
+    claims = require_rag_capability(request, "embed", [file_id])
     response_status = True
     response_message = "File processed successfully."
     known_type = None
@@ -900,6 +914,9 @@ async def embed_file(
             user_id=user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            index_metadata=(
+                {"tenant_id": claims["tenant"]} if claims.get("tenant") else None
+            ),
         )
 
         if not result:
@@ -962,7 +979,7 @@ async def reindex_file(
     source_digest: str = Form(None),
 ):
     """Atomically replace stale vectors from current source bytes."""
-    require_rag_capability(request, "embed", [file_id])
+    claims = require_rag_capability(request, "embed", [file_id])
     user_id = get_user_id(request, entity_id)
     temp_path = _make_unique_temp_path(user_id, file.filename)
     if temp_path is None:
@@ -984,11 +1001,13 @@ async def reindex_file(
             previous = await vector_store.get_documents_by_ids(
                 [file_id], executor=request.app.state.thread_pool
             )
+            require_rag_tenant(claims, (document.metadata for document in previous))
             await vector_store.delete(
                 ids=[file_id], executor=request.app.state.thread_pool
             )
         else:
             previous = vector_store.get_documents_by_ids([file_id])
+            require_rag_tenant(claims, (document.metadata for document in previous))
             vector_store.delete(ids=[file_id])
         try:
             result = await store_data_in_vector_db(
@@ -1000,6 +1019,7 @@ async def reindex_file(
                 index_metadata={
                     "index_generation": generation,
                     "source_digest": actual_digest,
+                    **({"tenant_id": claims["tenant"]} if claims.get("tenant") else {}),
                 },
             )
             if not result or "error" in result:
@@ -1032,7 +1052,7 @@ async def reindex_file(
 
 @router.get("/documents/{id}/context")
 async def load_document_context(request: Request, id: str):
-    require_rag_capability(request, "context", [id])
+    claims = require_rag_capability(request, "context", [id])
     ids = [id]
     try:
         if isinstance(vector_store, AsyncPgVector):
@@ -1045,6 +1065,8 @@ async def load_document_context(request: Request, id: str):
         else:
             existing_ids = vector_store.get_filtered_ids(ids)
             documents = vector_store.get_documents_by_ids(ids)
+
+        require_rag_tenant(claims, (document.metadata for document in documents))
 
         # Ensure the requested id exists
         if not all(id in existing_ids for id in ids):
@@ -1086,7 +1108,7 @@ async def embed_file_upload(
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
 ):
-    require_rag_capability(request, "embed", [file_id])
+    claims = require_rag_capability(request, "embed", [file_id])
     user_id = get_user_id(request, entity_id)
 
     validated_temp_file_path = _make_unique_temp_path(user_id, uploaded_file.filename)
@@ -1116,6 +1138,9 @@ async def embed_file_upload(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            index_metadata=(
+                {"tenant_id": claims["tenant"]} if claims.get("tenant") else None
+            ),
         )
 
         if not result:
@@ -1155,7 +1180,7 @@ async def embed_file_upload(
 
 @router.post("/query_multiple")
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
-    require_rag_capability(request, "query", body.file_ids)
+    claims = require_rag_capability(request, "query", body.file_ids)
     try:
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
@@ -1174,6 +1199,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             )
 
         documents = _apply_distance_threshold(documents)
+        require_rag_tenant(claims, (document.metadata for document, _ in documents))
 
         # Ensure documents list is not empty
         if not documents:

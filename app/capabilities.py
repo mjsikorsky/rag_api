@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from fastapi import HTTPException, Request, status
 
@@ -36,3 +36,15 @@ def require_rag_capability(
             status_code=status.HTTP_403_FORBIDDEN, detail="Invalid tenant capability"
         )
     return claims
+
+
+def require_rag_tenant(claims: dict, metadata: Iterable[Mapping]) -> None:
+    """Refuse access when a scoped token does not match persisted tenant identity."""
+    tenant = claims.get("tenant")
+    if tenant is None:
+        return
+    if any(row.get("tenant_id") != tenant for row in metadata):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token tenant does not authorize the requested file",
+        )
